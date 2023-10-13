@@ -1,38 +1,33 @@
-import os
-import json
 import argparse
 import itertools
+import json
 import math
+import os
+
 import torch
+import torch.distributed as dist
+# from tensorboardX import SummaryWriter
+import torch.multiprocessing as mp
+import tqdm
 from torch import nn, optim
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-# from tensorboardX import SummaryWriter
-import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
-import tqdm
-
 import commons
+import models
 import utils
-from data_utils import (
-    TextAudioSpeakerLoader,
-    TextAudioSpeakerCollate,
-    DistributedBucketSampler,
-)
-from models import (
-    SynthesizerTrn,
-    MultiPeriodDiscriminator,
-    DurationDiscriminator,
-    AVAILABLE_FLOW_TYPES,
-)
-from losses import generator_loss, discriminator_loss, feature_loss, kl_loss
+from data_utils import (DistributedBucketSampler, TextAudioSpeakerCollate,
+                        TextAudioSpeakerLoader)
+from losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from models import (AVAILABLE_DURATION_DISCRIMINATOR_TYPES,
+                    AVAILABLE_FLOW_TYPES, 
+                    DurationDiscriminatorV1, DurationDiscriminatorV2,
+                    MultiPeriodDiscriminator, SynthesizerTrn)
 from text.symbols import symbols
-
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
@@ -58,6 +53,7 @@ def main():
 
 
 def run(rank, n_gpus, hps):
+    net_dur_disc = None
     global global_step
     if rank == 0:
         logger = utils.get_logger(hps.model_dir)
@@ -160,15 +156,36 @@ def run(rank, n_gpus, hps):
         "use_duration_discriminator" in hps.model.keys()
         and hps.model.use_duration_discriminator == True
     ):
-        print("Using duration discriminator for VITS2")
+        # print("Using duration discriminator for VITS2")
         use_duration_discriminator = True
-        net_dur_disc = DurationDiscriminator(
-            hps.model.hidden_channels,
-            hps.model.hidden_channels,
-            3,
-            0.1,
-            gin_channels=hps.model.gin_channels if hps.data.n_speakers != 0 else 0,
-        ).cuda(rank)
+
+        # comment - choihkk
+        # add duration discriminator type here
+        # I think it would be a good idea to come up with a method to input this part accurately, like a hydra
+        duration_discriminator_type = getattr(
+            hps.model, "duration_discriminator_type", "dur_disc_1"
+        )
+        print(f"Using duration_discriminator {duration_discriminator_type} for VITS2")
+        assert (
+            duration_discriminator_type in AVAILABLE_DURATION_DISCRIMINATOR_TYPES
+        ), f"duration_discriminator_type must be one of {AVAILABLE_DURATION_DISCRIMINATOR_TYPES}"
+        duration_discriminator_type = AVAILABLE_DURATION_DISCRIMINATOR_TYPES
+        if duration_discriminator_type == "dur_disc_1":
+            net_dur_disc = DurationDiscriminatorV1(
+                hps.model.hidden_channels,
+                hps.model.hidden_channels,
+                3,
+                0.1,
+                gin_channels=hps.model.gin_channels if hps.data.n_speakers != 0 else 0,
+            ).cuda(rank)
+        elif duration_discriminator_type == "dur_disc_2":
+            net_dur_disc = DurationDiscriminatorV2(
+                hps.model.hidden_channels,
+                hps.model.hidden_channels,
+                3,
+                0.1,
+                gin_channels=hps.model.gin_channels if hps.data.n_speakers != 0 else 0,
+            ).cuda(rank) 
     else:
         print("NOT using any duration discriminator like VITS1")
         net_dur_disc = None
@@ -206,10 +223,16 @@ def run(rank, n_gpus, hps):
     else:
         optim_dur_disc = None
 
+    # comment - choihkk
+    # if we comment out unused parameter like DurationDiscriminator's self.pre_out_norm1,2 self.norm_1,2
+    # and ResidualCouplingTransformersLayer's self.post_transformer
+    # we don't have to set find_unused_parameters=True
+    # but I will not proceed with commenting out for compatibility with the latest work for others
     net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
     net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     if net_dur_disc is not None:
-        net_dur_disc = DDP(net_dur_disc, device_ids=[rank], find_unused_parameters=True)
+        net_dur_disc = DDP(
+            net_dur_disc, device_ids=[rank], find_unused_parameters=True)
 
     try:
         _, _, _, epoch_str = utils.load_checkpoint(
@@ -343,8 +366,12 @@ def train_and_evaluate(
             ):
                 mel = spec
             else:
+                # comment - choihkk
+                # for numerical stable when using fp16 and torch>=2.0.0,
+                # spec.float() could be help in the training stage
+                # https://github.com/jaywalnut310/vits/issues/15
                 mel = spec_to_mel_torch(
-                    spec,
+                    spec.float(),
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
                     hps.data.sampling_rate,
@@ -522,6 +549,7 @@ def train_and_evaluate(
                         epoch,
                         os.path.join(hps.model_dir, "DUR_{}.pth".format(global_step)),
                     )
+                utils.remove_old_checkpoints(hps.model_dir, prefixes=["G_*.pth", "D_*.pth", "DUR_*.pth"])
         global_step += 1
 
     if rank == 0:

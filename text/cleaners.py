@@ -16,6 +16,8 @@ import re
 from unidecode import unidecode
 from phonemizer import phonemize
 import num2words
+from phonemizer.backend import EspeakBackend
+backend = EspeakBackend("es", preserve_punctuation=True, with_stress=True)
 
 # Regular expression matching whitespace:
 _whitespace_re = re.compile(r"\s+")
@@ -119,19 +121,19 @@ def english_cleaners2(text):
     phonemes = collapse_whitespace(phonemes)
     return phonemes
 
+def english_cleaners3(text):
+    """Pipeline for English text, including abbreviation expansion. + punctuation + stress"""
+    text = convert_to_ascii(text)
+    text = lowercase(text)
+    text = expand_abbreviations(text)
+    phonemes = backend.phonemize([text], strip=True)[0]
+    phonemes = collapse_whitespace(phonemes)
+    return phonemes
+
 def spanish_cleaners(text):
     '''Pipeline for Spanish text (using phonemes)'''
     text  = convert_num_to_words(text, language="es")
-    phonemes = phonemize(
-        text,
-        language='es',
-        backend='espeak',
-        strip=True,
-        preserve_punctuation=True,
-        with_stress=True,
-        punctuation_marks = ';:,.!?¡¿—…"«»“”()',
-        language_switch='remove-flags'
-    )
+    phonemes = backend.phonemize([text], strip=True)[0]
     phonemes = collapse_whitespace(phonemes)
     phonemes = phonemes.strip()
     return phonemes
@@ -151,4 +153,5 @@ def spanish_cleaners2(text):
     )
     phonemes = collapse_whitespace(phonemes)
     phonemes = phonemes.strip()
-    return phonemes
+
+
